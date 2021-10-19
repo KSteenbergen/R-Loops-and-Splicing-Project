@@ -1,0 +1,857 @@
+---
+title: "R-loops and Splicing Differential Expression Analysis"
+author: "Kristen Steenbergen"
+date: "22/06/2021"
+output: 
+  html_document:
+      theme: spacelab
+      code_folding: hide
+      toc: true
+      toc_float: true
+---
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      message = FALSE, 
+                      warning = FALSE,
+                      cache = TRUE,
+                      fig.show = 'hold')
+```
+
+```{r libraries}
+library(tximport) 
+library(DESeq2)
+library(pheatmap)
+library(AnnotationDbi)
+library(EnhancedVolcano)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(RColorBrewer)
+library(EnsDb.Hsapiens.v86)
+library(msigdbr)
+library(clusterProfiler)
+library(ggpubr)
+library(ggVennDiagram)
+library(VennDiagram)
+library(enrichR)
+library(enrichplot)
+library(DT)
+library(plotly)
+```
+
+# Introduction
+
+The following analysis is a Differential Gene Expression Analysis exploring the RNA-seq data of Mesenchymal Stem Cells (MSCs), and Ewing Sarcoma Cells (TC32) that were both treated with the spliceosome-inhibiting drug E7101.  This analysis was completed for the R-loops and Splicing project.
+
+### Questions to Answer:
+1. What are the genes which are overexpressed and underexpressed with E7107 treatment in MSCs and TC32? What pathways do they relate to?  
+2. What are the DEGs with E7107 treatment in both cell lines? What pathways do they relate to?  
+3. What are the DEGs which are exclusive to only TC32 cells? What pathways do they relate to?
+
+# Effects of E7107
+##### Question #1: What are the genes which are overexpressed and underexpressed with E7107 treatment in MSCs and TC32? What pathways do they relate to?
+
+## Data Import and Inspection
+The data was imported from Salmon quantification files using `tximport`.  A variance-stabilizing transformation was applied to the count data and a principal component analysis (PCA) plot was generated.  Upon inspection of the PCA, it was determined that one of the MSC samples had an unacceptable level of divergence and therefore should be excluded.  The non-treated MSC sample was censored from the rest of the analysis.
+```{r importUncensored, out.width="50%", fig.height=5}
+#Transcript to Gene Annotation
+edb <- EnsDb.Hsapiens.v86
+k <- keys(edb, keytype = "TXNAME")
+tx2gene <- AnnotationDbi::select(x = edb, keys = k, columns = "SYMBOL", 
+                                 keytype ="TXNAME") 
+# "_uc" = "Uncensored"
+
+#Create a data frame with sample names, and condition
+sampleTable_uc <- data.frame(
+  sample_id = c("MSC.1", "MSC.2", "MSC.3", "MSCE7.1", "MSCE7.2", "MSCE7.3","TC32.1", 
+                "TC32.2", "TC32.3", "TC32E7.1", "TC32E7.2", "TC32E7.3"),
+  condition = factor(rep(c("NT", "E7107"), times = 2, each = 3)),
+  cell = c(rep("MSC",6), rep("TC32", 6)))
+
+#Create named list pointing to quantification file locations
+dir <-  "data/rnaseq_TC32_MSC_E7107/salmon_out/"
+files_uc <- file.path(dir, sampleTable_uc$sample_id, "quant.sf")
+names(files_uc) <- sampleTable_uc$sample_id
+
+#Import data from Salmon quant files
+txi.salmon_uc <- tximport(files_uc, type = "salmon", tx2gene = tx2gene, ignoreTxVersion = TRUE)
+
+#DESeq Dataset:
+dds_uc <- DESeqDataSetFromTximport(txi = txi.salmon_uc, colData = sampleTable_uc, design = ~condition)
+
+#QC Visualization:
+#Variance Stabilization
+vsd_uc <- vst(dds_uc, blind = FALSE)
+
+#PCA plot
+plotPCA(vsd_uc, intgroup = c("condition", "cell")) +
+  ggtitle("PCA of Condition")+
+  coord_fixed(ratio = 3)#Appears to be an outlier
+
+#Only MSC Line: 
+MSC_idx_uc <- grep("MSC", names(files_uc))
+MSC_files_uc <- files_uc[MSC_idx_uc]
+
+MSC_txi.salmon_uc <- tximport(MSC_files_uc, type = "salmon", tx2gene = tx2gene, ignoreTxVersion = TRUE)
+#Sample table and DESeq Dataset:
+MSC_sampleTable_uc <- sampleTable_uc[grep("MSC", sampleTable_uc$sample_id),]%>% select("condition")
+
+MSC_dds_uc <- DESeqDataSetFromTximport(txi = MSC_txi.salmon_uc, colData = MSC_sampleTable_uc, 
+                                    design = ~condition)
+
+#Variance Stabilization, PCA Plot, and Heatmap
+MSC_vsd_uc <- vst(MSC_dds_uc, blind = FALSE)
+plotPCA(MSC_vsd_uc) + ggtitle("MSC PCA of Condition")  #Need to remove MSC.2 going forward
+
+```
+
+The subsequent PCA shows a distinct clustering of the cell lines.  This clustering is echoed in the hierarchical heatmap showing that the cell lines have high correlation between samples.  The distinct grouping between the two cell lines denote high quality data and increase the reliability of biologically relevant information that is detected.   
+```{r importCensored, out.width="50%"}
+#Import Data:
+
+#Transcript to Gene Annotation
+edb <- EnsDb.Hsapiens.v86
+k <- keys(edb, keytype = "TXNAME")
+tx2gene <- AnnotationDbi::select(x = edb, keys = k, columns = "SYMBOL", 
+                                 keytype ="TXNAME") 
+
+#Create a data frame with sample names, and condition
+sampleTable <- data.frame(
+  sample_id = c("MSC.1", "MSC.2", "MSC.3", "MSCE7.1", "MSCE7.2", "MSCE7.3","TC32.1", 
+                "TC32.2", "TC32.3", "TC32E7.1", "TC32E7.2", "TC32E7.3"),
+  condition = factor(rep(c("NT", "E7107"), times = 2, each = 3)),
+  cell = c(rep("MSC",6), rep("TC32", 6)))
+sampleTable <- sampleTable[which((sampleTable$sample_id) != "MSC.2"),]  #Censor MSC2
+
+#Create named list pointing to quantification file locations
+dir <-  "data/rnaseq_TC32_MSC_E7107/salmon_out/"
+files <- file.path(dir, sampleTable$sample_id, "quant.sf")
+names(files) <- sampleTable$sample_id
+
+#Import data from Salmon quant files
+txi.salmon <- tximport(files, type = "salmon", tx2gene = tx2gene, ignoreTxVersion = TRUE)
+
+#DESeq Dataset:
+dds <- DESeqDataSetFromTximport(txi = txi.salmon, colData = sampleTable, design = ~condition)
+
+#QC Visualization:
+
+#Variance Stabilization
+vsd <- vst(dds, blind = FALSE)
+
+#PCA plot
+PCA_plot <- plotPCA(vsd, intgroup = c("condition", "cell")) + coord_fixed(4)
+PCA_plot +
+  ggtitle("PCA of Condition")+
+  coord_fixed(ratio = 7)
+
+#Hierarchical Heatmap using correlation values between samples
+vsd_matrix <- assay(vsd)
+vsd_corr <- cor(vsd_matrix)
+pheatmap(vsd_corr,  main = "Hierarchical Heatmap")
+
+```
+
+## Calculation of DEGs using `DESeq` 
+Differential Analysis was carried out using `DESeq2` followed by a shrinkage of log2 fold changes.  The MA plot indicates a high number of differentially expressed genes, and the adjacent histogram shows that many of the differentially expressed genes (DEGs) have significant p-values.  The heatmap shows a clear distinction between the two cell lines as well as strong clustering between treatments.
+
+```{r DESeq_all_1, fig.show='hold', out.width='50%'}
+#Run DESeq Analysis
+if (file.exists("analysis/DGE/rds_files/ddsrun.rds")){
+  ddsrun <- readRDS("analysis/DGE/rds_files/ddsrun.rds")
+} else {                                              
+  ddsrun <- DESeq(dds)
+  saveRDS(ddsrun, "analysis/DGE/rds_files/ddsrun.rds")
+}
+res <- results(ddsrun, contrast=c("condition", "E7107", "NT"))
+
+# LFC shrink 
+resNorm <- lfcShrink(dds = ddsrun, res = res, 
+                     type = "normal", contrast=c("condition", "E7107", "NT"))
+#MA plot:
+plotMA(resNorm, main = "MA Plot")
+
+#p-value Histogram:
+hist(res$pvalue[res$baseMean > 1], breaks = 0:20/20,
+     col = "grey50", border = "white",
+     xlab = "pValue where baseMean > 1",
+     main = 'Histogram of P-Values')
+
+```
+``` {r DESeq_all_2, fig.show='hold', out.width='50%', fig.height=7}
+#Data Frame of Normalized Results
+res_df <- as.data.frame(resNorm)
+
+#Enhanced Volcano Plot
+EnhancedVolcano(res_df, lab = rownames(res_df), pCutoff = .05,
+                FCcutoff = 1,
+                x = "log2FoldChange", y = "padj", ylim = c(0, 75),
+                title = 'Differential Expression of E7107 vs NT', subtitle = "")
+
+#Gene Clustering - Heatmap of top 20 diff expressed genes
+top_20 <- rownames(head(arrange(res_df, padj), 20))
+mat <- assay(vsd)[top_20,]
+annot <- as.data.frame(colData(vsd)[, c("cell","condition")])
+pheatmap(mat, annotation_col = annot, 
+         scale = "row",
+         main = 'Heatmap of Top 20 DEGs')
+
+```
+
+## Over-Representation Analysis
+```{r ORA_all_1, out.width='100%', fig.show='asis'}
+#Significantly Overexpressed Genes
+overexpressed <- res_df %>%  
+  rownames_to_column() %>%
+  rename("Gene" = rowname) %>%
+  dplyr::filter(padj<.05 & log2FoldChange > 0) %>%
+  write_csv(file = "analysis/DGE/csv_files/OverExpressedGenes.csv") 
+
+#Significantly Underexpressed Genes
+underexpressed <- res_df %>%
+  rownames_to_column() %>%
+  rename("Gene" = rowname) %>%
+  dplyr::filter(padj<.05 & log2FoldChange < 0) %>%
+  write_csv(file = "analysis/DGE/csv_files/UnderExpressedGenes.csv" )
+
+# Set up EnrichR Permalinks
+Enrich_Lst <- list( "Overexpressed" = overexpressed$Gene, "Underexpressed" = underexpressed$Gene)
+enrichLinks <- lapply(names(Enrich_Lst), function(group) {
+  genes<- Enrich_Lst[[group]]
+  response <- httr::POST(url = 'https://maayanlab.cloud/Enrichr/addList', body = list(
+    'list' = paste0(genes, collapse = "\n"),
+    'description' = group
+  ))
+  jsonlite::fromJSON(httr::content(response, as = "text"))
+})
+names(enrichLinks) <- names(Enrich_Lst)
+
+permalinks <- lapply(names(enrichLinks), function(x){
+  paste0("https://maayanlab.cloud/Enrichr/enrich?dataset=", enrichLinks[[x]]$shortId)
+  })
+names(permalinks) <- names(Enrich_Lst)
+
+```
+
+The KEGG and BioPlanet databases were selected for the over-representation analysis.  The over- and underexpressed gene sets were analyzed using the `enrichR` R package.
+
+Differentially expressed genes sets were again run through the Enrichr Web Tool and the analysis with all possible gene sets are below:  
+* [Overexpressed Genes](`r permalinks$Overexpressed`)    
+* [Underexpressed genes](`r permalinks$Underexpressed`)
+
+```{r ORA_all_2, out.width='100%', fig.show='hold'}
+#Setup EnrichR Library and declare database
+setEnrichrSite("Enrichr")
+websiteLive <- TRUE
+dbs <- c("KEGG_2019_Human", "BioPlanet_2019")
+
+#Function for generating EnrichR plots:
+enrichplotfxn <- function(x){
+  x %>%
+    top_n(10, Combined.Score) %>% 
+    arrange(desc(Combined.Score)) %>%
+    mutate(Term = factor(Term, levels = rev(Term))) %>%
+    ggplot(aes(x = Term, y = Combined.Score, fill = -log10(Adjusted.P.value))) +
+    geom_bar(stat = "identity") +
+    theme_bw(base_size = 12) +
+    xlab(NULL) +
+    scale_x_discrete(labels = function(x) str_wrap(x, width=30)) +
+    labs(fill = "-Log10 \n Adjusted \n P Value") +
+    ylab("Combined Score") +
+    theme(plot.title = element_text(size = 12, hjust = 1), legend.title =element_text(size=9)) +
+    coord_flip()
+}
+
+#EnrichR Enrichment Analysis:
+enrichr_Lst <- lapply(Enrich_Lst, function(x){
+  if(websiteLive){ 
+    enrichr(x, dbs)    #This returns list of data-frames for each database
+} })
+
+#Plot results
+overexp_KEGG <- enrichplotfxn(enrichr_Lst$Overexpressed$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Significantly Overexpressed Genes")
+overexp_KEGG
+
+underexp_KEGG <- enrichplotfxn(enrichr_Lst$Underexpressed$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Significantly Underexpressed Genes")
+underexp_KEGG
+
+```
+
+## Gene Set Enrichment Analysis of DEGs
+
+For the gene set enrichment analysis (GSEA), the ranking metric used was the `stat` value calculated using `DESeq2`.  The pathway enrichment analysis utilized `clusterProfiler` in R using `msigdb` Ontology gene set collection `(C5)`.   
+
+```{r GSEA_all, out.width='100%'}
+#GSEA
+
+# Get the gene sets - using Ontology collection
+gene_sets <- msigdbr(species = "Homo sapiens", category = "C5")
+gene_sets <- gene_sets %>%
+  dplyr::select(gs_name, gene_symbol)
+
+
+#GSEA metric added to results data frame
+# remove 0s from padj values arrange in desc order using stat
+res_gsea <- res_df %>%
+  mutate(padj = case_when(padj == 0 ~ .Machine$double.xmin,
+                          TRUE ~ padj)) %>%
+  filter(! is.na(stat)) %>%
+  arrange(desc(stat))
+
+# Get the ranked GSEA vector
+ranks <- res_gsea %>%
+  rownames_to_column(var = 'SYMBOL') %>%
+  select(SYMBOL, stat) %>%
+  distinct(SYMBOL, .keep_all = TRUE) %>%
+  deframe()
+
+# Run GSEA
+gsea_results <- GSEA(geneList = ranks, 
+                TERM2GENE = gene_sets)
+gsearesdf <- as.data.frame(gsea_results)
+
+n_pathways <- nrow(gsearesdf)
+#Visualize GSEA:
+gsea_dotplot <- dotplot(gsea_results) + 
+  labs(title = "Gene Set Enrichment Anlaysis") +
+  theme(plot.title = element_text(size = 12, hjust = .5), 
+        legend.title =element_text(size=8), 
+        axis.text.y = element_text(size = 8))
+gsea_dotplot
+
+# GSEA plots for top and bottom results
+# Top Overexpressed Pathways
+top_pathways <- gsearesdf %>%
+  top_n(n = 4, wt = NES) %>%
+  pull(ID)
+
+grouped_top_pathway_plot <- gseaplot2(gsea_results, geneSetID = top_pathways)
+grouped_top_pathway_plot
+
+#Excluded top underexpressed pathways as there weren't many
+
+```
+
+Only `r n_pathways` pathways were identified.  This lower number is possibly due to the inclusion of both cell types in the analysis.  Next, the same analysis will be completed in tandem for each of the cell types.
+
+# Effect of E7107 on Cell Type
+##### Question #2: What are the DEGs with E7107 treatment in both cell lines? What pathways do they relate to?
+
+## Data Inspection, `DESeq` Analysis and Visualization
+The analysis was carried out with each cell line separately using the same parameters as above unless otherwise stated.  The separation of the samples based on treatment with E7107 is evident in both the PCA and correlation heatmap plots.
+```{r import_cells, fig.show="hold", out.width="50%"}
+#Define sample tables for each cell line
+MSC_sampleTable <- sampleTable[grep("MSC", sampleTable$sample_id),]
+TC32_sampleTable <- sampleTable[grep("TC32", sampleTable$sample_id),]
+
+#Create file vector for each cell line
+#MSC
+MSC_idx <- grep("MSC", names(files))
+MSC_files <- files[MSC_idx]
+#TC32
+TC32_idx <- grep("TC32", names(files))
+TC32_files <- files[TC32_idx]
+
+#Import Salmon files and Prep Dataset for DESeq2 Analysis:
+#MSC
+MSC_txi.salmon <- tximport(MSC_files, type = "salmon", tx2gene = tx2gene, ignoreTxVersion = TRUE)
+MSC_dds <- DESeqDataSetFromTximport(txi = MSC_txi.salmon, colData = MSC_sampleTable, 
+                                    design = ~condition)
+#TC32
+TC32_txi.salmon <- tximport(TC32_files, type = "salmon", tx2gene = tx2gene, ignoreTxVersion = TRUE)
+TC32_dds <- DESeqDataSetFromTximport(txi = TC32_txi.salmon, colData = TC32_sampleTable, 
+                                    design = ~condition)
+
+#Variance Stabilization, PCA Plot, and Heatmap
+#MSC
+MSC_vsd <- vst(MSC_dds, blind = FALSE)
+plotPCA(MSC_vsd) + 
+  ggtitle("PCA for MSC")
+MSC_vsd_matrix <- assay(MSC_vsd)
+MSC_vsd_corr <- cor(MSC_vsd_matrix)
+pheatmap(MSC_vsd_corr, main = "Correlation heatmap of MSC samples", fontsize = 8)
+
+#TC32
+TC32_vsd <- vst(TC32_dds, blind = FALSE) 
+plotPCA(TC32_vsd)+ 
+  ggtitle("PCA for TC32")
+TC32_vsd_matrix <- assay(TC32_vsd)
+TC32_vsd_corr <- cor(TC32_vsd_matrix)
+pheatmap(TC32_vsd_corr, main = "Correlation heatmap of TC32 samples", fontsize = 8)
+```
+
+The MA plots show that there are a number of differentially expressed genes in each cell line.
+
+```{r DESeq_cells, fig.show="hold", out.width="50%"}
+#Run DESeq2:
+#MSC:
+if (file.exists("analysis/DGE/rds_files/MSC_dds.rds")){
+  MSC_dds <- readRDS("analysis/DGE/rds_files/MSC_dds.rds")
+} else {                                              
+  MSC_dds <- DESeq(MSC_dds)
+  saveRDS(MSC_dds, "analysis/DGE/rds_files/MSC_dds.rds")
+}
+MSC_res <- results(MSC_dds, contrast=c("condition", "E7107", "NT"))
+
+#TC32:
+if (file.exists("analysis/DGE/rds_files/TC32_dds.rds")){
+  TC32_dds <- readRDS("analysis/DGE/rds_files/TC32_dds.rds")
+} else {                                              
+  TC32_dds <- DESeq(TC32_dds)
+  saveRDS(TC32_dds, "analysis/DGE/rds_files/TC32_dds.rds")
+}
+TC32_res <- results(TC32_dds, contrast=c("condition", "E7107", "NT"))
+
+# LFC shrink and MA Plot:
+#MSC:
+MSC_resNorm <- lfcShrink(dds = MSC_dds, res = MSC_res, 
+                     type = "normal", contrast=c("condition", "E7107", "NT"))
+plotMA(MSC_resNorm, main="MSC MA Plot")
+
+#TC32:
+TC32_resNorm <- lfcShrink(dds = TC32_dds, res = TC32_res, 
+                     type = "normal", contrast=c("condition", "E7107", "NT"))
+plotMA(TC32_resNorm, main="TC32 MA Plot")
+```
+
+Additionally, in the heatmap plots, it is notable that the samples cluster based on their condition, and expression levels differ based on treatment.
+
+```{r Volcano_HeatMap_Cell, fig.show='hold', out.width='50%', fig.height= 7}
+#MSC:
+MSC_res_df <- as.data.frame(MSC_resNorm)
+EnhancedVolcano(MSC_res_df, lab = rownames(res_df), pCutoff = .01,
+                FCcutoff = 1,
+                x = "log2FoldChange", y = "padj", 
+                title = 'MSC Diffentially Expressed Genes', subtitle = "Effect of E7107 vs NT")
+
+#TC32:
+TC32_res_df <- as.data.frame(TC32_resNorm)
+EnhancedVolcano(TC32_res_df, lab = rownames(res_df), pCutoff = .01,
+                FCcutoff = 1,
+                x = "log2FoldChange", y = "padj", 
+                title = 'TC32 Diffentially Expressed Genes', subtitle = "Effect of E7107 vs NT")
+
+#Gene Clustering - Heatmap of top 20 DE Genes:
+#MSC:
+MSC_top_20 <- rownames(head(arrange(MSC_res_df, padj), 20))
+MSC_mat <- assay(MSC_vsd)[MSC_top_20,]
+MSC_annot <- as.data.frame(colData(MSC_vsd)[, c("cell","condition")])
+pheatmap(MSC_mat, annotation_col = MSC_annot, 
+         scale = "row",
+         main = 'Heatmap of Top 20 MSC DEGs')
+
+#TC32:
+TC32_top_20 <- rownames(head(arrange(TC32_res_df, padj), 20))
+TC32_mat <- assay(TC32_vsd)[TC32_top_20,]
+TC32_annot <- as.data.frame(colData(TC32_vsd)[, c("cell","condition")])
+pheatmap(TC32_mat, annotation_col = TC32_annot, 
+         scale = "row",
+         main = 'Heatmap of Top 20 TC32 DEGs')
+```
+
+## Comparison of Differentially Expressed Genes
+
+The venn diagrams show the overlap of the number of genes that were over- and underexpressed in both cell lines.  Interestingly, in both the over- and underexpressed gene comparisons, the number of MSC DEGs that overlap with TC32 DEGs is greater than the number of DEGs specific to MSC. 
+
+```{r venns_cell, fig.show='hold', out.width='50%'}
+#Over- and Underexpressed genes:
+#MSC:
+MSC_overexpressed <- MSC_res_df %>%  
+  rownames_to_column() %>%
+  rename("Gene" = rowname) %>%
+  dplyr::filter(padj<.05 & log2FoldChange > 0) %>%
+  write_csv(file = "analysis/DGE/csv_files/MSC_OverExpressedGenes.csv")
+
+MSC_underexpressed <- MSC_res_df %>%
+  rownames_to_column() %>%
+  rename("Gene" = rowname) %>%
+  dplyr::filter(padj<.05 & log2FoldChange < 0) %>%
+  write_csv(file = "analysis/DGE/csv_files/MSC_UnderExpressedGenes.csv")
+
+#TC32:
+TC32_overexpressed <- TC32_res_df %>%  
+  rownames_to_column() %>%
+  rename("Gene" = rowname) %>%
+  dplyr::filter(padj<.05 & log2FoldChange > 0) %>%  
+  write_csv(file = "analysis/DGE/csv_files/TC32_OverExpressedGenes.csv") 
+
+TC32_underexpressed <- TC32_res_df %>%
+  rownames_to_column() %>%
+  rename("Gene" = rowname) %>%
+  dplyr::filter(padj<.05 & log2FoldChange < 0) %>%
+  write_csv(file = "analysis/DGE/csv_files/TC32_UnderExpressedGenes.csv")
+
+#Venn Diagram of the over- and underexpressed genes between the two cell lines 
+#Overexpressed Genes 
+grid.newpage()
+over <- venn.diagram(list(MSC_overexpressed$Gene, TC32_overexpressed$Gene), 
+                  category.names = c("MSC", "TC32"),
+                  filename = NULL,
+                  fontfamily = "sans serif", cat.fontfamily = "sans serif",
+                  main= "Overlapping Overexpressed Genes",
+                  main.fontfamily = "sans serif", main.cex = 1.25,
+                  fill=c("red","deepskyblue4"),
+                  lwd = 1, lty = 1)
+grid.draw(over)
+
+#Underexpressed Genes 
+grid.newpage()
+under <- venn.diagram(list(MSC_underexpressed$Gene, TC32_underexpressed$Gene), 
+                     category.names = c("MSC", "TC32"),
+                     filename = NULL,
+                     fontfamily = "sans serif", cat.fontfamily = "sans serif",
+                     main= "Overlapping Underexpressed Genes",
+                     main.fontfamily = "sans serif", main.cex = 1.25,
+                     fill=c("red","deepskyblue4"),
+                     lwd = 1, lty = 1)
+grid.draw(under)
+```
+
+The plot below displays genes that are identified as being differentially expressed in both cell types.  Data with a p-value of .05 or less are colored to indicate the effect size in one cell line or both.  
+
+```{r 4-way, out.width='80%'}
+# 4-way plot- Comparison of Expression levels between DEGs in diff Cell lines
+#Construct gene list for fourway plot data frame
+#MSC:
+MSC_list <- MSC_res_df %>% select(log2FoldChange, padj) %>%
+  rownames_to_column() %>%
+  rename("MSC_Log2FC" = log2FoldChange, "MSC_padj" = padj, "Gene" = rowname) %>%
+  drop_na()
+
+#TC32:
+TC32_list <- TC32_res_df %>% select(log2FoldChange, padj) %>%
+  rownames_to_column() %>%
+  rename("TC32_Log2FC" = log2FoldChange, "TC32_padj" = padj, "Gene" = rowname) %>%
+  drop_na()
+
+#Groups:
+#1. "Both" = padj(x,y)<0.05 & |lfc(x,y)|>1  = #Both Significant and Both >+/-1 Log2FC
+#2. "MSC-only" = padj(x)<0.05 & |lfc(x)|>1, |lfc(y)|<1  = #Only Significant in MSC with >+/-1 Log2FC
+#3. "TC32-only" = padj(y)<0.05 & |lfc(x)|<1, |lfc(y)|>1 =  #Only Significant in TC32 with >+/-1 Log2FC
+#4. "Not Significant" = padj(x,y)>0.05 = #Not Significant in either
+
+#Data frame
+fourwy_df <- inner_join(MSC_list, TC32_list, by="Gene")%>%                  
+  mutate(Sig_Group = case_when(
+    MSC_padj <0.05 & TC32_padj >0.05 &         
+      abs(MSC_Log2FC) > 1  ~ "MSC-only",       
+    MSC_padj >0.05 & TC32_padj <0.05 &         
+      abs(TC32_Log2FC) > 1 ~ "TC32-only",      
+    MSC_padj<0.05 & TC32_padj <0.05 &          
+      abs(MSC_Log2FC) > 1 | abs(TC32_Log2FC) > 1  ~ "Both",   
+    TRUE ~ "Not Significant"
+  ))
+
+#Fourway Scatter Plot:
+dge_fourway <- ggplot(data = fourwy_df, aes(x = MSC_Log2FC, y=TC32_Log2FC, label=Gene, color=Sig_Group)) +
+  geom_point(alpha = .8) +
+  geom_hline(yintercept=0, size = .1)+
+  geom_vline(xintercept=0, size = .1)+
+  coord_fixed(ratio = 1)+ 
+  scale_color_manual(values=c(
+    "Both" = "blue", 
+    "MSC-only" = "darkgoldenrod2",
+    "Not Significant" = "grey", 
+    "TC32-only" = "firebrick"))+
+  labs(title = "Log2 Fold Changes of Genes Differentially Expressed in Both Cell Lines", color = "LFC Greater than |1|") 
+#dge_fourway
+
+ggplotly(dge_fourway, tooltip = "Gene")
+```
+
+## Over-Representation Analysis
+
+```{r ORA_cells_1, out.width='90%', fig.show='asis'}
+# Set up EnrichR Permalinks
+Enrich_Lst_cell <- list( "MSC_Over" = MSC_overexpressed$Gene, "TC32_Over" = TC32_overexpressed$Gene, 
+                    "MSC_Under" = MSC_underexpressed$Gene, "TC32_Under" = TC32_underexpressed$Gene)
+enrichLinks_cell <- lapply(names(Enrich_Lst_cell), function(group) {
+  genes<- Enrich_Lst_cell[[group]]
+  response <- httr::POST(url = 'https://maayanlab.cloud/Enrichr/addList', body = list(
+    'list' = paste0(genes, collapse = "\n"),
+    'description' = group
+  ))
+  jsonlite::fromJSON(httr::content(response, as = "text"))
+})
+names(enrichLinks_cell) <- names(Enrich_Lst_cell)
+
+permalinks_cell <- lapply(names(enrichLinks_cell), function(x){
+  paste0("https://maayanlab.cloud/Enrichr/enrich?dataset=", enrichLinks_cell[[x]]$shortId)
+  })
+names(permalinks_cell) <- names(Enrich_Lst_cell)
+
+```
+
+
+Links to enrichR analysis using all possible gene sets:  
+
+##### MSC Enrichr Results:
+* [Overexpressed genes in MSC](`r permalinks_cell$MSC_Over`)  
+* [Underexpressed genes in MSC](`r permalinks_cell$MSC_Under`)  
+  
+##### TC32 Enrichr Results:  
+* [Overexpressed genes in TC32](`r permalinks_cell$TC32_Over`)  
+* [Underexpressed genes in TC32](`r permalinks_cell$TC32_Under`)  
+
+
+The top 10 results from the the KEGG database are displayed below. Interestingly, in the overexpressed DEGs there is a high level of enrichment of genes associated with the spliceosome.
+
+### Overexpressed Genes:
+```{r ORA_cells_2, out.width='90%', fig.show='asis'}
+#EnrichR Enrichment Analysis:
+enrichr_Lst_cell <- lapply(Enrich_Lst_cell, function(x){
+  if(websiteLive){ 
+    enrichr(x, dbs)    
+} })
+
+#Plot Results:
+#Overexpressed Genes:
+enrichplotfxn(enrichr_Lst_cell$MSC_Over$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Significantly Overexpressed MSC Genes")
+
+enrichplotfxn(enrichr_Lst_cell$TC32_Over$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Significantly Overexpressed TC32 Genes")
+```
+
+### Underexpressed Genes:
+```{r ORA_cells_3, out.width='90%', fig.show='asis'}
+#Underexpressed Genes:
+enrichplotfxn(enrichr_Lst_cell$MSC_Under$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Significantly Underexpressed MSC Genes")
+
+enrichplotfxn(enrichr_Lst_cell$TC32_Under$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Significantly Underexpressed TC32 Genes")
+
+```
+
+## Gene Set Enrichment Analysis
+
+In this GSEA, the cell lines were again analyzed in parallel, and the resulting dotplot, and GSEA plots for both the MSC and TC32 cells highlighting the top and bottom enriched pathways are below.
+
+```{r GSEA1_cell, out.width='100%'}
+#GSEA:
+#Set up GSEA ranks vector and run GSEA, visualize with dotplot
+#MSC
+MSC_res_gsea <- MSC_res_df %>%
+  mutate(padj = case_when(padj == 0 ~ .Machine$double.xmin,
+                          TRUE ~ padj)) %>%
+  filter(! is.na(stat)) %>%
+  arrange(desc(stat))
+
+MSC_ranks <- MSC_res_gsea %>%
+  rownames_to_column(var = 'SYMBOL') %>%
+  select(SYMBOL, stat) %>%
+  distinct(SYMBOL, .keep_all = TRUE) %>%
+  deframe()
+
+MSC_gseares <- GSEA(geneList = MSC_ranks, 
+                     TERM2GENE = gene_sets)
+dotplot(MSC_gseares, font.size = 8) +   #Try to wrap y-axis values - may not be an issue on the Markdown
+  ggtitle("MSC GSEA")
+
+#TC32
+TC32_res_gsea <- TC32_res_df %>%
+  mutate(padj = case_when(padj == 0 ~ .Machine$double.xmin,
+                          TRUE ~ padj)) %>%
+  filter(! is.na(stat)) %>%
+  arrange(desc(stat))
+
+TC32_ranks <- TC32_res_gsea %>%
+  rownames_to_column(var = 'SYMBOL') %>%
+  select(SYMBOL, stat) %>%
+  distinct(SYMBOL, .keep_all = TRUE) %>%
+  deframe()
+TC32_gseares <- GSEA(geneList = TC32_ranks, 
+                     TERM2GENE = gene_sets)
+dotplot(TC32_gseares, font.size = 8) + 
+  ggtitle("TC32 GSEA")
+```
+
+### MSC Top and Bottom Pathways:
+```{r MSC_GSEA_pathways_cell}
+#MSC:
+#Top Pathways:
+MSC_gsearesdf <- as.data.frame(MSC_gseares)
+MSC_top_pathways <- MSC_gsearesdf %>%
+  top_n(n = 4, wt = NES) %>%
+  pull(ID)
+MSC_top_pathway_plots <- lapply(MSC_top_pathways, function(pathway) {
+  gseaplot(MSC_gseares, geneSetID = pathway)})
+MSC_top_pathway_plot <- gseaplot2(MSC_gseares, geneSetID = MSC_top_pathways) %>%
+  annotate_figure(top = text_grob("Top MSC Pathways", size=15))
+MSC_top_pathway_plot
+
+#Bottom Pathways:
+MSC_bottom_pathways <- MSC_gsearesdf %>%
+  top_n(n = 4, wt = -NES) %>%
+  pull(ID)
+MSC_bottom_pathway_plots <- lapply(MSC_bottom_pathways, function(pathway) {
+  gseaplot(MSC_gseares, geneSetID = pathway)
+})
+MSC_bottom_pathway_plot <- gseaplot2(MSC_gseares, geneSetID = MSC_bottom_pathways) %>%
+  annotate_figure(top = text_grob("Bottom MSC Pathways", size=15))
+MSC_bottom_pathway_plot
+
+```
+
+
+### TC32 Top and Bottom Pathways:
+```{r TC32_GSEA_pathways_cell}
+#TC32:
+#Top Pathways:
+TC32_gsearesdf <- as.data.frame(TC32_gseares)
+
+TC32_top_pathways <- TC32_gsearesdf %>%
+  top_n(n = 4, wt = NES) %>%
+  pull(ID)
+TC32_top_pathway_plot <- gseaplot2(TC32_gseares, geneSetID = TC32_top_pathways) %>%
+  annotate_figure(top = text_grob("Top TC32 Pathways", size=15))
+TC32_top_pathway_plot
+
+#Bottom Pathways:
+TC32_bottom_pathways <- TC32_gsearesdf %>%
+  top_n(n = 4, wt = -NES) %>%
+  pull(ID)
+TC32_bottom_pathway_plot <- gseaplot2(TC32_gseares, geneSetID = TC32_bottom_pathways) %>%
+  annotate_figure(top = text_grob("Bottom TC32 Pathways", size=15))
+TC32_bottom_pathway_plot
+
+```
+
+The venn diagram displays the overlap of pathways between the two cell types. 
+```{r pathway_venn, out.width='65%'}
+#Pathway Overlap between the two pathway sets     
+pathways <- ggVennDiagram(x=list(MSC=MSC_gsearesdf$ID, TC32=TC32_gsearesdf$ID)) +
+  ggtitle("Overlapping Pathways between Cell Lines") + 
+  theme(plot.title = element_text(hjust = 0.5)) + scale_color_brewer(palette = "Blues") +
+  scale_fill_gradient(low = "#ece7f2", high = "#2b8cbe")
+pathways
+```
+
+### Pathway Datatables: {.tabset}
+#### MSC-Only Pathways
+```{r MSC_only_pathdata}
+path_overlap <- intersect(MSC_gsearesdf$ID, TC32_gsearesdf$ID)
+'%!in%' <- Negate('%in%')
+
+cell_gsea_list <- list('MSC' = MSC_gsearesdf, "TC32" = TC32_gsearesdf)
+
+pathway_data <- lapply(cell_gsea_list, function(x){ (x[x$ID %!in% path_overlap,] %>%
+                                                  rownames_to_column("Pathway")%>% 
+                                                  arrange(rank) %>%
+                                                  select(c(-ID, -Description)) %>%
+                                                  datatable())
+})
+
+pathway_data$MSC
+```
+
+#### TC32-Only Pathways
+```{r TC32_only_pathdata}
+pathway_data$TC32
+```
+
+#### Shared Pathways
+
+```{r shared_pathdata}
+both_pathways <- inner_join(MSC_gsearesdf, TC32_gsearesdf, by="ID") %>% 
+  mutate(meanrank = rowMeans(cbind(rank.x, rank.y))) %>%                  #sort by rank means
+  arrange(meanrank) %>%
+  select(starts_with(c("ID", "enrichmentScore", "NES", "p", "rank", "core_enrichment")))
+names(both_pathways) <- gsub('*.y', '.TC32', names(both_pathways))
+names(both_pathways) <-  gsub('*.x','.MSC', names(both_pathways))
+shared_path_data <- datatable(both_pathways)
+shared_path_data
+
+```
+
+# Effect of E7017 on TC32-specific DEGs
+##### Question #3: What are the DEGs which are exclusive to only TC32 cells? What pathways do they relate to?
+
+Only the differentially expressed genes that were exclusive to the TC32 cells were analyzed to assess what biological differences are specifically being detected in the Ewing Sarcoma cells.  Again, the analysis was completed using the same parameters as above.
+
+```{r TC32sp_ORA_enrich, out.width='90%'}
+#TC32-Specific Gene Set - These are significantly differentially Expressed
+'%!in%' <- Negate('%in%')
+TC32specific_over_genes <- TC32_overexpressed[TC32_overexpressed$Gene %!in% MSC_overexpressed$Gene,] %>%
+  write_csv(file = "analysis/DGE/csv_files/TC32-specific_OverexpressedGenes.csv")
+
+TC32specific_under_genes <- TC32_underexpressed[TC32_underexpressed$Gene %!in% MSC_underexpressed$Gene,]%>%
+  write_csv(file = "analysis/DGE/csv_files/TC32-specific_UnderexpressedGenes.csv")
+
+#Set up EnrichR Permalinks
+Enrich_Lst_TC32only <- list( "TC32only_Over" = TC32specific_over_genes$Gene, 
+                         "TC32only_Under" = TC32specific_under_genes$Gene)
+enrichLinks_TC32only <- lapply(names(Enrich_Lst_TC32only), function(group) {
+  genes<- Enrich_Lst_TC32only[[group]]
+  response <- httr::POST(url = 'https://maayanlab.cloud/Enrichr/addList', body = list(
+    'list' = paste0(genes, collapse = "\n"),
+    'description' = group
+  ))
+  jsonlite::fromJSON(httr::content(response, as = "text"))
+})
+names(enrichLinks_TC32only) <- names(Enrich_Lst_TC32only)
+
+permalinks_TC32only <- lapply(names(enrichLinks_TC32only), function(x){
+  paste0("https://maayanlab.cloud/Enrichr/enrich?dataset=", enrichLinks_TC32only[[x]]$shortId)
+  })
+names(permalinks_TC32only) <- names(Enrich_Lst_TC32only)
+```
+
+##### TC32-specific Enrichr Results:  
+* [TC32-specific Overexpressed genes](`r permalinks_TC32only$TC32only_Over`)    
+* [TC32-specific Underexpressed genes](`r permalinks_TC32only$TC32only_Under`)  
+
+For a broader representation of the data, both the KEGG and BioPlanet database results from the over-representation analysis.
+
+### TC32-specific Overexpressed:
+```{r TC32sp_ORA_over, out.width='90%'}
+#EnrichR Enrichment Analysis:
+enrichr_Lst_TC32only <- lapply(Enrich_Lst_TC32only, function(x){
+  if(websiteLive){ 
+    enrichr(x, dbs)    
+} })
+
+
+#Plot Results:
+enrichplotfxn(enrichr_Lst_TC32only$TC32only_Over$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Significantly Over-Expressed Genes Specific to TC32")
+enrichplotfxn(enrichr_Lst_TC32only$TC32only_Over$BioPlanet_2019) + 
+  labs(title = "Top BioPlanet Pathways Enriched in Significantly Over-Expressed Genes Specific to TC32")
+```
+
+### TC32-specific Underexpressed:
+``` {r TC32sp_ORA_under, out.width='90%'}
+#Plot Results:
+enrichplotfxn(enrichr_Lst_TC32only$TC32only_Under$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Significantly Underexpressed Genes Specific to TC32")
+enrichplotfxn(enrichr_Lst_TC32only$TC32only_Under$BioPlanet_2019) + 
+  labs(title = "Top BioPlanet Pathways Enriched in Significantly Underexpressed Genes Specific to TC32")
+
+```
+
+# Differentially Expressed Gene Data
+Data for all of the included DE Genes:
+### MSC DEG Data:
+```{r MSC_datatable, out.width='100%'}
+#MSC
+MSC_data <- MSC_res_df %>% 
+  replace_na(list(padj=1)) %>%
+  drop_na()
+MSC_datatable <- datatable(MSC_data)
+MSC_datatable
+```
+
+### TC32 DEG Data:
+```{r TC32_datatable, out.width='100%'}
+#TC32
+TC32_data <- TC32_res_df %>% 
+  replace_na(list(padj=1)) %>%
+  drop_na()
+TC32_datatable <- datatable(TC32_data)
+TC32_datatable
+```

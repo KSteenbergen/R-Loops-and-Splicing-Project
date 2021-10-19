@@ -1,0 +1,699 @@
+---
+title: "Differential Transcript Usage Analysis"
+author: "Kristen Steenbergen"
+date: "22/06/2021"
+output:
+  html_document:
+      theme: spacelab
+      code_folding: hide
+      toc: true
+      toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+knitr::opts_chunk$set(echo = TRUE, 
+                      message = FALSE, 
+                      cache = TRUE,
+                      warning = FALSE)
+```
+```{r libraries}
+#Load Libraries
+library(EnsDb.Hsapiens.v86)
+library(tximport) 
+library(dplyr)
+library(tidyverse)
+library(DRIMSeq)
+library(stageR)
+library(DEXSeq)
+library(DT)
+library(enrichR)
+library(EnhancedVolcano)
+library(ggplot2)
+library(VennDiagram)
+library(ggrepel)
+library(stringr)
+library(cowplot)
+library(plotly)
+
+```
+
+# Introduction
+
+The purpose of this analysis was to assess differential transcript usage (DTU) in Ewing sarcoma cells(TC32) when treated with spliceosome-inhibiting drug E7101 using mesenchymal stem cells(MSC) as a control.  This analysis is completed for the R-loops and Splicing project.
+
+### The Questions to Answer:  
+1. What transcripts are differentially used between E7107 treated and control groups? What genes do they relate to?
+2. Is there any difference in a particular kind of splicing event? E.G., retained introns, alternative last exons, etc.
+
+```{r import_files }
+#Create a data frame with sample names, and condition
+sampleTable <- data.frame(
+  sample_id = c("MSC.1", "MSC.2", "MSC.3", "MSCE7.1", "MSCE7.2", "MSCE7.3","TC32.1", 
+                "TC32.2", "TC32.3", "TC32E7.1", "TC32E7.2", "TC32E7.3"),
+  condition = factor(rep(c("NT", "E7107"), times = 2, each = 3)),
+  cell = c(rep("MSC",6), rep("TC32", 6)))
+sampleTable <- sampleTable[which((sampleTable$sample_id) != "MSC.2"),]  #Censor MSC2
+
+# Import Salmon Quantification Data
+directory <-  "data/rnaseq_TC32_MSC_E7107/salmon_out"
+files <- file.path(directory, sampleTable$sample_id, "quant.sf")
+names(files) <- sampleTable$sample_id
+#Censor MSC2 - See PCA from Diff Gene Expression Analysis - too much divergence
+files <- files[which(names(files) != "MSC.2")]
+
+#Create SampleTable and file vector for each cell line
+
+#MSC
+MSC_sampleTable <- sampleTable[grep("MSC", sampleTable$sample_id),]
+#TC32
+TC32_sampleTable <- sampleTable[grep("TC32", sampleTable$sample_id),]
+
+#MSC
+MSC_idx <- grep("MSC", names(files))
+MSC_files <- files[MSC_idx]
+#TC32
+TC32_idx <- grep("TC32", names(files))
+TC32_files <- files[TC32_idx]
+
+#Transcript to Gene Annotation
+edb <- EnsDb.Hsapiens.v86
+k <- keys(edb, keytype = "TXNAME")
+tx2gene <- AnnotationDbi::select(x = edb, keys = k, columns = "SYMBOL", 
+                                 keytype ="TXNAME") 
+
+
+#Import data from Salmon quant files
+#MSC
+MSC_txi <- tximport(MSC_files, type = "salmon", txOut = TRUE, 
+                countsFromAbundance = "scaledTPM",
+                tx2gene = tx2gene, ignoreTxVersion = TRUE)
+#Remove 0 counts
+MSC_cts <- MSC_txi$counts
+MSC_cts <- as.data.frame(MSC_cts[rowSums(MSC_cts)>0,])
+
+#TC32
+TC32_txi <- tximport(TC32_files, type = "salmon", txOut = TRUE, 
+                countsFromAbundance = "scaledTPM",
+                tx2gene = tx2gene, ignoreTxVersion = TRUE)
+#Remove 0 counts
+TC32_cts <- TC32_txi$counts
+TC32_cts <- as.data.frame(TC32_cts[rowSums(TC32_cts)>0,])
+
+# Transcript-to-Gene Mapping - Using ENSEMBL database
+#MSC
+MSC_cts<- MSC_cts %>%
+  rownames_to_column() %>%
+  mutate(TXNAME = gsub(rowname, pattern = "\\..+", replacement = "")) %>%
+  inner_join(y = tx2gene, by = "TXNAME") %>%
+  dplyr::select(-TXID)
+
+#TC32
+TC32_cts<- TC32_cts %>%
+  rownames_to_column() %>%
+  mutate(TXNAME = gsub(rowname, pattern = "\\..+", replacement = "")) %>%
+  inner_join(y = tx2gene, by = "TXNAME") %>%
+  dplyr::select(-TXID)
+
+```
+
+# Analysis
+This analysis was carried out following the DTU workflow laid out by [Love et. al](http://bioconductor.org/packages/release/workflows/vignettes/rnaseqDTU/inst/doc/rnaseqDTU.html).  This workflow uses the `DRIMSeq` and `DEXSeq` Bioconductor packages to model and test for DTU.  Both of these steps are followed by `stageR` analysis which carries out a two-stage assessment of the expression data.  The first stage looks at which genes show evidence of DTU, and the second stage assesses which of the transcripts from the DTU genes are involved.
+
+### DRIMSeq
+```{r DRIM}
+
+#Build dataframe for DRIMSeq
+
+#MSC
+MSC_counts <- MSC_cts %>% dplyr::select(SYMBOL, TXNAME, contains("."))%>%
+  rename(gene_id = SYMBOL, feature_id = TXNAME)
+#Prep data an create DRIMSeq data object
+MSC_d <- dmDSdata(counts=MSC_counts, samples=MSC_sampleTable)
+
+
+#TC32
+TC32_counts <- TC32_cts %>% dplyr::select(SYMBOL, TXNAME, contains("."))%>%
+  rename(gene_id = SYMBOL, feature_id = TXNAME)
+#Prep data an create DRIMSeq data object
+TC32_d <- dmDSdata(counts=TC32_counts, samples=TC32_sampleTable)
+
+
+#Filter - Used filter thresholds as outlined in Love et al. DTU Workflow
+#MSC
+MSC_n <- 5
+MSC_n.small <- 2 
+MSC_d_filtered <- dmFilter(MSC_d, 
+                       min_samps_feature_expr=MSC_n.small, min_feature_expr=10,
+                       min_samps_feature_prop=MSC_n.small, min_feature_prop=0.1,
+                       min_samps_gene_expr=MSC_n, min_gene_expr=10)
+
+#TC32
+TC32_n <- 6
+TC32_n.small <- 3 
+TC32_d_filtered <- dmFilter(TC32_d, 
+                       min_samps_feature_expr=TC32_n.small, min_feature_expr=10,
+                       min_samps_feature_prop=TC32_n.small, min_feature_prop=0.1,
+                       min_samps_gene_expr=TC32_n, min_gene_expr=10)
+
+#Create Design matrix 
+#MSC
+MSC_design_full <- model.matrix(~condition, data=DRIMSeq::samples(MSC_d))
+#TC32
+TC32_design_full <- model.matrix(~condition, data=DRIMSeq::samples(TC32_d))
+
+# Estimate Model Parameters and test for DTU
+
+#MSC
+if (file.exists("analysis/DTU/rds_files/MSC_d.rds")){
+  MSC_d <- readRDS("analysis/DTU/rds_files/MSC_d.rds")
+} else {                                              #Time-consuming Computation
+  MSC_d <- dmPrecision(MSC_d_filtered, design=MSC_design_full)
+  MSC_d <- dmFit(MSC_d, design=MSC_design_full)
+  MSC_d <- dmTest(MSC_d, coef="conditionNT")
+  saveRDS(MSC_d, "analysis/DTU/rds_files/MSC_d.rds")
+}
+
+#Results
+MSC_res <- DRIMSeq::results(MSC_d)                        #Gene-level results
+MSC_res.txp <- DRIMSeq::results(MSC_d, level="feature")   #Transcript-level results
+
+#TC32
+if (file.exists("analysis/DTU/rds_files/TC32_d.rds")){
+  TC32_d <- readRDS("analysis/DTU/rds_files/TC32_d.rds")
+} else {                                              #Time-consuming Computation
+  TC32_d <- dmPrecision(TC32_d_filtered, design=TC32_design_full)
+  TC32_d <- dmFit(TC32_d, design=TC32_design_full)
+  TC32_d <- dmTest(TC32_d, coef="conditionNT")
+  saveRDS(TC32_d, "analysis/DTU/rds_files/TC32_d.rds")
+}
+#Results
+TC32_res <- DRIMSeq::results(TC32_d)                        #Gene-level results
+TC32_res.txp <- DRIMSeq::results(TC32_d, level="feature")   #Transcript-level results
+
+
+#Convert NAs in p-values to 1 
+no.na <- function(x) ifelse(is.na(x), 1, x)
+#MSC
+MSC_res$pvalue <- no.na(MSC_res$pvalue)
+MSC_res.txp$pvalue <- no.na(MSC_res.txp$pvalue)
+#TC32
+TC32_res$pvalue <- no.na(TC32_res$pvalue)
+TC32_res.txp$pvalue <- no.na(TC32_res.txp$pvalue)
+```
+
+## Transcript Proportions
+The following plots display the transcript usage for a few specific genes identified as having DTU after the DRIMSeq analysis.  Further information on these genes can be found here:  
+  * RBM39 - https://www.genecards.org/cgi-bin/carddisp.pl?gene=RBM39   
+  * FXR1 - https://www.genecards.org/cgi-bin/carddisp.pl?gene=FXR1&keywords=FXR1  
+  * MRPL4 - https://www.genecards.org/cgi-bin/carddisp.pl?gene=MRPL12&keywords=MRPL7  
+  * SKP2 - https://www.genecards.org/cgi-bin/carddisp.pl?gene=SKP2  
+
+Note the difference in transcript usage between cell lines as well as the number of transcripts expressed for each gene.
+```{r DRIMplots, cache=TRUE, fig.show="hold", out.width="50%"}
+rbm39_MSC <- plotProportions(MSC_d, gene_id= "RBM39", group_variable = "condition", plot_type = "barplot")+ 
+  labs(title = "RBM39 in MSC")
+rbm39_MSC
+rbm39 <- plotProportions(TC32_d, gene_id= "RBM39", group_variable = "condition", plot_type = "barplot")+ 
+  labs(title = "RBM39 in TC32")
+rbm39
+
+fxr1_MSC <- plotProportions(MSC_d, gene_id= "FXR1", group_variable = "condition", plot_type = "barplot")+ 
+  labs(title = "FXR1 in MSC")
+fxr1_MSC
+fxr1 <- plotProportions(TC32_d, gene_id= "FXR1", group_variable = "condition", plot_type = "barplot")+ 
+  labs(title = "FXR1 in TC32")
+fxr1
+
+mrpl4_MSC <- plotProportions(MSC_d, gene_id= "MRPL4", group_variable = "condition", plot_type = "barplot")+ 
+  labs(title = "MRPL4 in MSC")
+mrpl4_MSC
+mrpl4 <- plotProportions(TC32_d, gene_id= "MRPL4", group_variable = "condition", plot_type = "barplot")+ 
+  labs(title = "MRPL4 in TC32")
+mrpl4
+
+skp2_MSC <- plotProportions(MSC_d, gene_id= "SKP2", group_variable = "condition", plot_type = "barplot")+ 
+  labs(title = "SKP2 in MSC")
+skp2_MSC
+skp2 <- plotProportions(TC32_d, gene_id= "SKP2", group_variable = "condition", plot_type = "barplot")+ 
+  labs(title = "SKP2 in TC32")
+skp2
+```
+
+### stageR following DRIMSeq
+```{r DRIMstageR}
+# stageR following DRIMSeq
+
+# Build a vector of p-values - one for screening step and one for confirmation step
+#MSC
+MSC_pScreen <- MSC_res$pvalue
+names(MSC_pScreen) <- MSC_res$gene_id
+#One-column matrix of confirmation p-values:
+MSC_pConfirmation <- matrix(MSC_res.txp$pvalue, ncol=1)
+rownames(MSC_pConfirmation) <- MSC_res.txp$feature_id
+#Transcript id and gene identifiers:
+MSC_tx2genestageR <- MSC_res.txp[,c("feature_id", "gene_id")]
+
+#TC32
+TC32_pScreen <- TC32_res$pvalue
+names(TC32_pScreen) <- TC32_res$gene_id
+#One-column matrix of confirmation p-values:
+TC32_pConfirmation <- matrix(TC32_res.txp$pvalue, ncol=1)
+rownames(TC32_pConfirmation) <- TC32_res.txp$feature_id
+#Transcript id and gene identifiers:
+TC32_tx2genestageR <- TC32_res.txp[,c("feature_id", "gene_id")]
+
+
+#stageR following DRIMSeq Analysis:  
+#MSC
+MSC_stageRObj <- stageRTx(pScreen=MSC_pScreen, 
+                          pConfirmation=MSC_pConfirmation,
+                          pScreenAdjusted=FALSE, 
+                          tx2gene=MSC_tx2genestageR)
+MSC_stageRObj <- stageWiseAdjustment(MSC_stageRObj, 
+                                     method="dtu", alpha=0.05)
+MSC_drim.padj <- getAdjustedPValues(MSC_stageRObj, 
+                                    order=FALSE, onlySignificantGenes=TRUE)
+#getSignificantGenes()
+MSC_drim_sigGenes <-as.data.frame(getSignificantGenes(MSC_stageRObj))
+colnames(MSC_drim_sigGenes) <- "padj"
+#getSignificantTx()
+MSC_sig.tx <- getSignificantTx(MSC_stageRObj)
+
+#TC32
+#stageR following DRIMSeq Analysis:  
+TC32_stageRObj <- stageRTx(pScreen=TC32_pScreen, 
+                          pConfirmation=TC32_pConfirmation,
+                          pScreenAdjusted=FALSE, 
+                          tx2gene=TC32_tx2genestageR)
+TC32_stageRObj <- stageWiseAdjustment(TC32_stageRObj, 
+                                     method="dtu", alpha=0.05)
+TC32_drim.padj <- getAdjustedPValues(TC32_stageRObj, 
+                                    order=FALSE, onlySignificantGenes=TRUE)
+#getSignificantGenes()
+TC32_drim_sigGenes <-as.data.frame(getSignificantGenes(TC32_stageRObj))
+colnames(TC32_drim_sigGenes) <- "padj"
+#getSignificantTx()
+TC32_sig.tx <- getSignificantTx(TC32_stageRObj)
+```
+
+### DEXSeq
+```{r DEXSeq}
+# DEXSeq
+
+#Build a DEXSeqDataSet from DRIMSeq dmDStest object
+#MSC
+MSC_sample.data <- DRIMSeq::samples(MSC_d)  #This needs to be class dmDStest - has DRIM-Seq results added
+MSC_count.data <- round(as.matrix(counts(MSC_d)[,-c(1:2)]))
+MSC_dxd <- DEXSeqDataSet(countData=MSC_count.data,
+                     sampleData=MSC_sample.data,
+                     design=~sample + exon + condition:exon, #This formula for DTU
+                     featureID=counts(MSC_d)$feature_id,
+                     groupID=counts(MSC_d)$gene_id)
+
+#TC32
+TC32_sample.data <- DRIMSeq::samples(TC32_d)
+TC32_count.data <- round(as.matrix(counts(TC32_d)[,-c(1:2)]))
+TC32_dxd <- DEXSeqDataSet(countData=TC32_count.data,
+                         sampleData=TC32_sample.data,
+                         design=~sample + exon + condition:exon, #This formula for DTU
+                         featureID=counts(TC32_d)$feature_id,
+                         groupID=counts(TC32_d)$gene_id)
+
+# Run DEXSeq Analysis
+#MSC
+if (file.exists("analysis/DTU/rds_files/MSC_dxd.rds")){
+  MSC_dxd <- readRDS("analysis/DTU/rds_files/MSC_dxd.rds")
+} else {
+  MSC_dxd <- estimateSizeFactors(MSC_dxd)
+  MSC_dxd <- estimateDispersions(MSC_dxd, quiet=TRUE)
+  MSC_dxd <- testForDEU(MSC_dxd, reducedModel=~sample + exon)
+  saveRDS(MSC_dxd, "analysis/DTU/rds_files/MSC_dxd.rds")
+}
+
+#TC32
+if (file.exists("analysis/DTU/rds_files/TC32_dxd.rds")){
+  TC32_dxd <- readRDS("analysis/DTU/rds_files/TC32_dxd.rds")
+} else {
+  TC32_dxd <- estimateSizeFactors(TC32_dxd)
+  TC32_dxd <- estimateDispersions(TC32_dxd, quiet=TRUE)
+  TC32_dxd <- testForDEU(TC32_dxd, reducedModel=~sample + exon)
+  saveRDS(TC32_dxd, "analysis/DTU/rds_files/TC32_dxd.rds")
+}
+
+#Extract DEXSeq Results 
+#MSC
+MSC_dxr <- DEXSeqResults(MSC_dxd, independentFiltering=FALSE)
+#results table with per-gene adjusted p-values(qval)
+MSC_qval <- perGeneQValue(MSC_dxr)
+#transcripts-level results table (sorted by pvalue, not filtered)
+columns <- c("featureID","groupID","pvalue", "stat", "padj")
+MSC_dxr_df <- as.data.frame(MSC_dxr[,columns])
+MSC_dxr_df <- MSC_dxr_df[order(MSC_dxr_df$pvalue),]
+
+#TC32
+TC32_dxr <- DEXSeqResults(TC32_dxd, independentFiltering=FALSE)
+#results table with per-gene adjusted p-values(qval) - used in stageR analysis below
+TC32_qval <- perGeneQValue(TC32_dxr)  #Named vector
+#transcripts-level results table (sorted by pvalue, not filtered)
+columns <- c("featureID","groupID","pvalue", "stat", "padj") 
+TC32_dxr_df <- as.data.frame(TC32_dxr[,columns])
+TC32_dxr_df <- TC32_dxr_df[order(TC32_dxr_df$pvalue),]
+```
+
+### stageR following DEXSeq
+
+```{r DEXstageR}
+# stageR following DEXSeq
+
+#Data prep for stageR - Same requirements as above for stageR following DRIMSeq
+#MSC
+MSC_pScreen_dx <- MSC_qval
+MSC_pConfirmation_dx <- matrix(MSC_dxr$pvalue,ncol=1)
+dimnames(MSC_pConfirmation_dx) <- list((MSC_dxr$featureID),"transcript")
+MSC_tx2gene_dx <- as.data.frame(MSC_dxr[,c("featureID", "groupID")])
+
+#TC32
+TC32_pScreen_dx <- TC32_qval
+TC32_pConfirmation_dx <- matrix(TC32_dxr$pvalue,ncol=1)
+dimnames(TC32_pConfirmation_dx) <- list((TC32_dxr$featureID),"transcript")
+TC32_tx2gene_dx <- as.data.frame(TC32_dxr[,c("featureID", "groupID")])
+
+#stageR Analysis
+
+#MSC
+MSC_stageRObj_dx <- stageRTx(pScreen=MSC_pScreen_dx, pConfirmation=MSC_pConfirmation_dx,
+                         pScreenAdjusted=TRUE, tx2gene=MSC_tx2gene_dx)
+MSC_stageRObj_dx <- stageWiseAdjustment(MSC_stageRObj_dx, method="dtu", alpha=0.05)
+MSC_dex.padj <- getAdjustedPValues(MSC_stageRObj_dx, order=FALSE,
+                               onlySignificantGenes=TRUE)
+#getSignificantGenes()
+MSC_dex_sigGenes <-  as.data.frame(getSignificantGenes(MSC_stageRObj_dx))
+colnames(MSC_dex_sigGenes) <- "padj"
+#getSignificantTx()
+MSC_dex_sig.tx <-  as.data.frame(getSignificantTx(MSC_stageRObj_dx))
+colnames(MSC_dex_sig.tx) <- "padj"
+
+#TC32
+TC32_stageRObj_dx <- stageRTx(pScreen=TC32_pScreen_dx, pConfirmation=TC32_pConfirmation_dx,
+                             pScreenAdjusted=TRUE, tx2gene=TC32_tx2gene_dx)
+TC32_stageRObj_dx <- stageWiseAdjustment(TC32_stageRObj_dx, method="dtu", alpha=0.05, allowNA=TRUE)
+TC32_dex.padj <- getAdjustedPValues(TC32_stageRObj_dx, order=FALSE,
+                                   onlySignificantGenes=TRUE)
+#getSignificantGenes()
+TC32_dex_sigGenes <-  as.data.frame(getSignificantGenes(TC32_stageRObj_dx))
+colnames(TC32_dex_sigGenes) <- "padj"
+#getSignificantTx()
+TC32_dex_sig.tx <-  as.data.frame(getSignificantTx(TC32_stageRObj_dx))
+colnames(TC32_dex_sig.tx) <- "padj"
+```
+
+# Data from `DRIM` and `DEXSeq` Analysis
+The following data tables display all genes involved in the analysis and their associated transcripts, along with pvalues, likelihood ratio(lr) from the DRIMSeq analysis, and stat score from the DEXSeq analysis.  
+
+### MSC Genes:
+```{r MSC_unfiltered_genetable, out.width='95%'}
+#Data frame of UNFILTERED results table from DRIM and DEXSeq 
+#MSC
+#First select DRIM data and rename
+MSC_drimdata <- MSC_res[, -which(names(MSC_res)== "df")]
+colnames(MSC_drimdata) <- c("Gene", "DRIM_lr", "DRIM_pvalue", "DRIM_padj")
+
+#Prepare DEX data
+MSC_dexdata <- MSC_dxr_df  #No NAs in this df
+colnames(MSC_dexdata) <- c("Transcript", "Gene", "DEX_pvalue", "DEX_stat", "DEX_padj")
+
+#Full Join
+MSC_unfiltered_df <- full_join(MSC_drimdata, MSC_dexdata, by="Gene") %>% 
+  replace_na(list(DRIM_lr=1, DRIM_pvalue=1, DRIM_padj=1)) %>%
+  replace_na(list(DEX_stat=1, DEX_pvalue=1, DEX_padj=1, Transcript='None')) %>%
+  select("Gene", "Transcript", everything()) %>% 
+  write_csv(file = "analysis/DTU/csv_files/DTU_MSC_unfiltered_results.csv")
+MSC_unfiltered_datatable <- datatable(MSC_unfiltered_df)
+MSC_unfiltered_datatable
+```
+
+### TC32 Genes:
+```{r TC32_unfiltered_genetable, out.width='95%'}
+#Data frame of UNFILTERED results table from DRIM and DEXSeq 
+#TC32
+#First select DRIM data and rename
+TC32_drimdata <- TC32_res[, -which(names(TC32_res)== "df")]
+colnames(TC32_drimdata) <- c("Gene", "DRIM_lr", "DRIM_pvalue", "DRIM_padj")
+
+#Prepare DEX data
+TC32_dexdata <- TC32_dxr_df  #No NAs in this df
+colnames(TC32_dexdata) <- c("Transcript", "Gene", "DEX_pvalue", "DEX_stat", "DEX_padj")
+
+#Full Join
+TC32_unfiltered_df <- full_join(TC32_drimdata, TC32_dexdata, by="Gene") %>% 
+  replace_na(list(DRIM_lr=1, DRIM_pvalue=1, DRIM_padj=1)) %>%
+  replace_na(list(DEX_stat=1, DEX_pvalue=1, DEX_padj=1, Transcript='None')) %>%
+  select("Gene", "Transcript", everything()) %>% 
+  write_csv(file = "analysis/DTU/csv_files/DTU_TC32_unfiltered_results.csv")
+TC32_unfiltered_datatable <- datatable(TC32_unfiltered_df)
+TC32_unfiltered_datatable
+```
+
+# Genes and Transcripts Showing Evidence of Significant DTU:
+The following data tables include genes indicating evidence of *significant* DTU identified from the stageR analysis, however, not all transcripts included have significant p-values.
+
+### Significant DTU Genes in MSC cells:
+```{r DTU_datatables_MSC, out.wdith="95%"}
+#MSC DTU Genes and Transcripts
+#Combine DEXSeq and DRIMSeq padj values from stageR- all the genes are significant but not all transcripts
+MSC_dtu <- MSC_drim.padj %>% full_join(MSC_dex.padj, by='txID') %>%
+  mutate("Gene" = geneID.x) 
+MSC_dtu$Gene <- ifelse(is.na(MSC_dtu$Gene), MSC_dtu$geneID.y, MSC_dtu$Gene)     #Assign Gene Symbol in each line of the data frame
+MSC_dtu  <-  MSC_dtu %>% 
+  rename("Transcript" = txID, "DRIMGene.padj" = gene.x, 
+         "DRIMTx.padj" = transcript.x, "DEXGene.padj" = gene.y, 
+         "DEXTx.padj" = transcript.y) %>%
+  select(Transcript, Gene, contains("DRIM"), contains("DEX"))%>%
+  replace_na(list(DRIMGene.padj=1, DRIMTx.padj=1, DEXGene.padj=1, DEXTx.padj=1)) %>% 
+  write_csv(file = "analysis/DTU/csv_files/DTU_MSC_results.csv")
+
+#Datatable of Results
+MSC_dtu_table <- datatable(MSC_dtu)
+MSC_dtu_table
+```
+
+### Significant DTU Genes in TC32 cells:
+```{r DTU_datatables_TC32, out.wdith="95%"}
+#TC32 DTU Genes and Transcripts
+#Combine DEXSeq and DRIMSeq padj values from stageR- all the genes are significant but not all transcripts
+TC32_dtu <- TC32_drim.padj %>% full_join(TC32_dex.padj, by='txID') %>%
+  mutate("Gene" = geneID.x) 
+TC32_dtu$Gene <- ifelse(is.na(TC32_dtu$Gene), TC32_dtu$geneID.y, TC32_dtu$Gene) #Assign Gene Symbol in each line of the data frame
+TC32_dtu  <-  TC32_dtu %>% 
+  rename("Transcript" = txID, "DRIMGene.padj" = gene.x, 
+         "DRIMTx.padj" = transcript.x, "DEXGene.padj" = gene.y, 
+         "DEXTx.padj" = transcript.y) %>%
+  select(Transcript, Gene, contains("DRIM"), contains("DEX")) %>%
+  replace_na(list(DRIMGene.padj=1, DRIMTx.padj=1, DEXGene.padj=1, DEXTx.padj=1))%>% 
+  write_csv(file = "analysis/DTU/csv_files/DTU_TC32_results.csv")
+
+#Datatable of Results
+TC32_dtu_table <- datatable(TC32_dtu)
+TC32_dtu_table
+```
+
+# Visualization of Effect size  
+The rank plots show the transcripts ranked based on the stat value from the `DEXSeq` analysis and are labeled for the gene that they belong to.
+
+```{r rank_plot, fig.show='hold'}
+#Hockey Stick Rank Plot
+
+#MSC
+MSC_dxr_rank <- MSC_dxr_df %>% arrange(stat, padj) %>% mutate(rank=min_rank(stat))
+
+MSC_rank <- ggplot(data=MSC_dxr_rank, aes(x=rank, y=stat, label=groupID)) +
+  geom_point(color = "red") +
+  geom_line() +
+  xlim(15000, 30000) +
+  geom_label_repel(data = MSC_dxr_rank %>% slice_tail(n=10), max.overlaps = 20,
+                  box.padding = 1, xlim = c(NA, 29000), hjust = 0, direction = "y")+
+  labs(x = "Rank", y = "Stat", title = "Rank plot of DEXSeq Stat for MSC Transcripts from DTU Genes")
+MSC_rank
+
+#TC32
+TC32_dxr_rank <- TC32_dxr_df %>% arrange(stat, padj) %>% mutate(rank=min_rank(stat))
+
+TC32_rank <- ggplot(data=TC32_dxr_rank, aes(x=rank, y=stat, label=groupID)) +
+  geom_point(color = "red") +
+  geom_line() +
+  xlim(15000, NA) +
+  geom_label_repel(data = TC32_dxr_rank %>% slice_tail(n=10), max.overlaps = 20,
+                   box.padding = 1, xlim = c(NA, 26500), hjust = 0, direction = "y")+
+  labs(x = "Rank", y = "Stat", title = "Rank plot of DEXSeq Stat for TC32 Transcripts from DTU Genes")
+TC32_rank
+```
+
+The four-way scatter plot displays the stat score from the `DEXSeq` analysis for each transcript in the overlapping group of DTU genes. 
+```{r fourway, out.width='100%', fig.height=7}
+#Make data frame of transcripts from DEXSeq results.  
+#Use transcripts that are only found in both cell lines and plot effect size against each other
+MSC_df <- MSC_dxr_df%>% rename(MSC_stat = stat)
+TC32_df <- TC32_dxr_df %>% rename(TC32_stat = stat)
+fourway_df <- inner_join(TC32_df, MSC_df, by="featureID") %>% 
+  rename("Gene" = groupID.x, "Transcript" = featureID) %>% 
+  select(-groupID.y) %>%
+  mutate("group" = case_when(
+    log(MSC_stat) > log(200) & log(TC32_stat) > log(200) ~ "High in Both",
+    log(TC32_stat) > log(200) & padj.x <.05 ~ "High in TC32",
+    log(MSC_stat) > log(200) & padj.x <.05 ~ "High in MSC",
+    TRUE ~ "Not Significant"
+  ))
+
+fourway_plot <- ggplot(data=fourway_df, 
+                       aes(x=log(MSC_stat), y=log(TC32_stat), label=Gene, color = group))+
+  geom_point(alpha = .4) +
+  scale_color_manual(values=c("High in Both" = "gold",  "High in MSC" = "dodgerblue", 
+                              "Not Significant" = "black", "High in TC32" = "tomato"))+
+  labs(x = "Log(stat) in MSC", y = "Log(stat) in TC32", 
+       title= "Scatter plot of stat scores in DTU genes found in both MSC and TC32") +
+  xlim(c(-2, 7))+
+  ylim(c(-2, 7)) +
+  geom_hline(yintercept=log(200), size = .1)+
+  geom_vline(xintercept=log(200), size = .1) + 
+  geom_text_repel(data=fourway_df %>% arrange(TC32_stat) %>% slice_tail(n=8), 
+                  box.padding = .75, max.overlaps = 20, color = "black") +
+  geom_text_repel(data=fourway_df %>% arrange(MSC_stat) %>% slice_tail(n=8), box.padding = 1, color = "black")+
+  theme_minimal()+
+  theme(plot.title = element_text(hjust = .5))+
+  coord_fixed(ratio=1)
+#fourway_plot
+ggplotly(fourway_plot, tooltip = "Gene")
+```
+
+# Pathway Enrichment Analysis  
+
+For pathway enrichment analysis, EnrichR web tool was used as it queries multiple available databases and the results querying all possible gene sets can be found here:  
+* [MSC Cell Enrichment](https://maayanlab.cloud/Enrichr/enrich?dataset=1314146da351b22a646735a2ad82bfbb)    
+* [TC32 Cell Enrichment](https://maayanlab.cloud/Enrichr/enrich?dataset=c2181a3fbf6b3070ad50e4b07ba3d777)  
+
+Furthermore, The `KEGG_2019_Human` and `BioPlanet_2019` databases were queried to enrich for relevent gene sets using the `enrichR` package for R.  Below are the results from the KEGG database for the MSC cells, and the results from both databases for the TC32 cells.
+
+``` {r enrichr, cache=TRUE, messages=FALSE, warning = FALSE, fig.show = "hold", out.width="100%"}
+#Pathway Analysis with Enrichr
+
+#EnrichR Package Set Up
+setEnrichrSite("Enrichr")
+websiteLive <- TRUE
+dbs <- c("KEGG_2019_Human", "BioPlanet_2019")
+
+#Function for EnrichR plots
+enrichplotfxn <- function(x){
+  x %>%
+    top_n(10, Combined.Score) %>% 
+    arrange(desc(Combined.Score)) %>%
+    mutate(Term = factor(Term, levels = rev(Term))) %>%
+    ggplot(aes(x = Term, y = Combined.Score, fill = -log10(Adjusted.P.value))) +
+    geom_bar(stat = "identity") +
+    theme_bw(base_size = 12) +
+    xlab(NULL) +
+    scale_x_discrete(labels = function(x) str_wrap(x, width=30)) +
+    labs(fill = "-Log10 \n Adjusted \n P Value") +
+    ylab("Combined Score") +
+    theme(plot.title = element_text(size = 12, hjust = 1), legend.title =element_text(size=9)) +
+    coord_flip()
+}
+
+#Remove duplicate gene rows and save gene sets into csv and data frame:
+MSC_distinctgenes <- MSC_dtu %>% distinct(Gene) %>% write_csv(file="analysis/DTU/csv_files/DTU_MSC_Genes.csv")
+TC32_distinctgenes <- TC32_dtu %>% distinct(Gene) %>% write_csv(file="analysis/DTU/csv_files/DTU_TC32_Genes.csv")
+
+#MSC Pathway Enrichment Analysis and Plotting
+if(websiteLive){
+  MSC_enriched <- enrichr(MSC_distinctgenes$Gene, dbs)    #This returns list of dataframes for each database
+}
+#Plot results
+MSC_KEGG <- enrichplotfxn(MSC_enriched$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in MSC DTU genes")
+MSC_KEGG
+
+#TC32 Pathway Enrichment Analysis and Plotting
+if(websiteLive){
+  TC32_enriched <- enrichr(TC32_distinctgenes$Gene, dbs)    #This returns list of dataframes for each database
+}
+#Plot results
+TC32_KEGG <- enrichplotfxn(TC32_enriched$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in TC32 DTU genes")
+TC32_KEGG
+
+TC32_Bioplanet <- enrichplotfxn(TC32_enriched$BioPlanet_2019) + 
+  labs(title = "Top BioPlanet Pathways Enriched in TC32 DTU genes")
+TC32_Bioplanet
+
+```
+
+# Overlapping DTU genes and Pathway Enrichment:
+
+To asses which genes showing DTU were unique to each cell type and how many were shared between the cell types, the venn diagram below was constructed. 
+```{r Venn_2}
+grid.newpage()
+v <- venn.diagram(list(MSC_dtu$Gene, TC32_dtu$Gene), 
+  category.names = c("MSC", "TC32"),
+  filename = NULL,
+  fontfamily = "sans serif", cat.fontfamily = "sans serif",
+  main= "Overlapping DTU genes from MSC and TC32 cells",
+  main.fontfamily = "sans serif", main.cex = 1.35,
+  fill=c("salmon","cadet blue"),
+  lwd = 1,
+  lty = 1)
+grid.draw(v);  
+```
+
+Pathway enrichment analysis was then carried out on three separate groups:  DTU genes that overlap between cell lines, MSC-specific DTU genes, and TC32-specific genes.  Results from the KEGG database are highlighted below and the BioPlanet database is also included for the TC32 cell lines.
+`EnrichR` Web Tool was also used and the links to those results can be found here:  
+* [Overlapping DTU Genes](https://maayanlab.cloud/Enrichr/enrich?dataset=68f04b029c01cc6d6f16d04472fa6688)  
+* [DTU Genes Specific to MSC](https://maayanlab.cloud/Enrichr/enrich?dataset=5113470ea24ef8ecee72606e9556222e)  
+* [DTU Genes Specific to TC32](https://maayanlab.cloud/Enrichr/enrich?dataset=fed8f3968558d6ea25733e8d4986f09d)  
+
+```{r enrichR_overlap_and_sepecific, out.width="100%", fig.show='hold'}
+#Overlapping DTU genes in both cell lines
+dtu_overlap <- intersect(MSC_distinctgenes, TC32_distinctgenes) %>%
+  write_csv( file = "analysis/DTU/csv_files/Overlapping_DTU_Genes.csv")
+
+#MSC-secific DTU genes
+MSCspecific_dtu <- setdiff(MSC_distinctgenes, TC32_distinctgenes) %>%
+  write_csv( file = "analysis/DTU/csv_files/MSCSpecific_DTU_Genes.csv")
+
+#TC32-secific DTU genes
+TC32specific_dtu <- setdiff(TC32_distinctgenes, MSC_distinctgenes) %>%
+  write_csv( file = "analysis/DTU/csv_files/TC32Specific_DTU_Genes.csv")
+
+enrichRgenes_List <- c("Overlap" = dtu_overlap, 
+                       "MSC-Specific" = MSCspecific_dtu, "TC32-Specific" = TC32specific_dtu)
+
+#EnrichR Enrichment Analysis:
+enrichr_res_list <- lapply(enrichRgenes_List, function(x){
+  if(websiteLive){ 
+    enrichr(x, dbs)    
+} })
+
+#Plot Results:
+#Overlap 
+enrichplotfxn(enrichr_res_list$Overlap.Gene$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in Overlapping DTU genes in both cell lines")
+#MSC-Specific
+enrichplotfxn(enrichr_res_list$`MSC-Specific.Gene`$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in MSC-specific DTU Genes")
+#TC32-Specific
+#KEGG pathways
+enrichplotfxn(enrichr_res_list$`TC32-Specific.Gene`$KEGG_2019_Human) + 
+  labs(title = "Top KEGG Pathways Enriched in TC32-specific DTU Genes")
+#BioPlanet pathways
+enrichplotfxn(enrichr_res_list$`TC32-Specific.Gene`$BioPlanet_2019) + 
+  labs(title = "Top BioPlanet Pathways Enriched in TC32-specific DTU Genes")
+```
+
+# Discussion
+**What transcripts are differentially used between E7107 treated and control groups? What genes do they relate to?**
+Using the `DRIMSeq` and `DEXSeq` packages, `r nrow(MSC_distinctgenes)` and `r nrow(TC32_distinctgenes)` genes were found to have evidence of differential transcript usage in the MSC and TC32 cell lines respectively. 
+When comparing the two cell lines for pathway enrichment, both gene sets are enriched in pathways that are involved in nucleotide excision repair, ubiquitin mediated proteolysis, and mRNA processing.  Interestingly, in the TC32 group, the spliceosome and RNA transport pathways have a greater enrichment than in the MSC control cell line.  
+
+**Is there any difference in a particular kind of splicing event? E.G., retained introns, alternative last exons, etc.**
+This question was attempted to be addressed by using IsoformSwitchAnalyzeR R package.  The results were inconclusive and for that reason, the code and data are not included here.
+
